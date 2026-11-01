@@ -9,6 +9,12 @@
 #include "lamp_controller.h"
 #include "led/single_led.h"
 #include "assets/lang_config.h"
+#include "servo_head.h"
+#include "ultrasonic_sensor.h"
+
+#include <atomic>
+#include <functional>
+#include <esp_timer.h>
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -21,12 +27,32 @@
 
 #define TAG "CompactWifiBoard"
 
+// OLED display that also tells the head servo when the emotion changes
+class EmotionOledDisplay : public OledDisplay {
+public:
+    using OledDisplay::OledDisplay;
+    std::function<void(const char*)> on_emotion;
+
+    void SetEmotion(const char* emotion) override {
+        OledDisplay::SetEmotion(emotion);
+        if (on_emotion) {
+            on_emotion(emotion);
+        }
+    }
+};
+
 class CompactWifiBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t display_i2c_bus_;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     Display* display_ = nullptr;
+    EmotionOledDisplay* emotion_display_ = nullptr;
+    ServoHead* servo_ = nullptr;
+    UltrasonicSensor* ultrasonic_ = nullptr;
+    esp_timer_handle_t emotion_timer_ = nullptr;
+    std::atomic<const char*> pending_emotion_{"neutral"};
+    int64_t last_auto_talk_ms_ = 0;
     Button boot_button_;
     Button touch_button_;
     Button volume_up_button_;
@@ -97,7 +123,8 @@ private:
         ESP_LOGI(TAG, "Turning display on");
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_, true));
 
-        display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        emotion_display_ = new EmotionOledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        display_ = emotion_display_;
     }
 
     void InitializeButtons() {
@@ -152,6 +179,80 @@ private:
         static LampController lamp(LAMP_GPIO);
     }
 
+    // ---- Head servo + ultrasonic sensor (from Jervice_XiaoZhi.ino) ----
+    void ShowEmotionLater(const char* emotion, int delay_ms) {
+        pending_emotion_ = emotion;   // always a string literal
+        esp_timer_stop(emotion_timer_);
+        esp_timer_start_once(emotion_timer_, (int64_t)delay_ms * 1000);
+    }
+
+    void OnPersonArrived(int distance_cm) {
+        auto& app = Application::GetInstance();
+        if (app.GetDeviceState() != kDeviceStateIdle) {
+            return;
+        }
+        auto display = GetDisplay();
+        if (distance_cm < 25) {                       // very close: get startled first
+            display->SetEmotion("surprised");
+            ShowEmotionLater("happy", 1200);
+        } else {
+            display->SetEmotion("happy");
+        }
+        display->ShowNotification("Hello!", 2000);
+
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (PRESENCE_AUTO_TALK && (last_auto_talk_ms_ == 0 || now_ms - last_auto_talk_ms_ > PRESENCE_AUTO_TALK_COOLDOWN_MS)) {
+            last_auto_talk_ms_ = now_ms;
+            app.ToggleChatState();                    // same as pressing the BOOT button: start talking
+        }
+    }
+
+    void OnHandNear() {
+        if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+            return;
+        }
+        auto display = GetDisplay();
+        display->SetEmotion("loving");
+        display->ShowNotification("<3", 3000);
+        ShowEmotionLater("happy", 4000);
+    }
+
+    void InitializeServoAndUltrasonic() {
+        esp_timer_create_args_t timer_args = {};
+        timer_args.callback = [](void* arg) {
+            auto* self = static_cast<CompactWifiBoard*>(arg);
+            const char* emotion = self->pending_emotion_.load();
+            Application::GetInstance().Schedule([self, emotion]() {
+                if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+                    self->GetDisplay()->SetEmotion(emotion);
+                }
+            });
+        };
+        timer_args.arg = this;
+        timer_args.name = "emotion_restore";
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &emotion_timer_));
+
+        servo_ = new ServoHead(SERVO_GPIO);
+        servo_->RegisterTools();
+        if (emotion_display_ != nullptr) {
+            emotion_display_->on_emotion = [this](const char* emotion) {
+                servo_->SetEmotion(emotion);
+            };
+        }
+
+        ultrasonic_ = new UltrasonicSensor(ULTRASONIC_TRIG_GPIO, ULTRASONIC_ECHO_GPIO, PRESENCE_DISTANCE_CM);
+        ultrasonic_->RegisterTools();
+        ultrasonic_->OnArrived = [this](int distance_cm) {
+            Application::GetInstance().Schedule([this, distance_cm]() { OnPersonArrived(distance_cm); });
+        };
+        ultrasonic_->OnHandNear = [this]() {
+            Application::GetInstance().Schedule([this]() { OnHandNear(); });
+        };
+        ultrasonic_->OnAloneChanged = [this](bool alone) {
+            servo_->SetAlone(alone);
+        };
+    }
+
 public:
     CompactWifiBoard() :
         boot_button_(BOOT_BUTTON_GPIO),
@@ -162,6 +263,7 @@ public:
         InitializeSsd1306Display();
         InitializeButtons();
         InitializeTools();
+        InitializeServoAndUltrasonic();
     }
 
     virtual Led* GetLed() override {

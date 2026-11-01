@@ -54,6 +54,16 @@
 
 
 // A MCP Test: Control a lamp
-#define LAMP_GPIO GPIO_NUM_18
+// (moved from GPIO 18 to GPIO 14 because GPIO 18 is now the ultrasonic ECHO pin)
+#define LAMP_GPIO GPIO_NUM_14
+
+// ---- Head servo + HC-SR04 ultrasonic sensor (pins taken from Jervice_XiaoZhi.ino) ----
+#define SERVO_GPIO           GPIO_NUM_21
+#define ULTRASONIC_TRIG_GPIO GPIO_NUM_17
+#define ULTRASONIC_ECHO_GPIO GPIO_NUM_18   // ECHO is 5 V: use a 1k + 2k voltage divider!
+
+#define PRESENCE_DISTANCE_CM 80            // someone closer than this = "present"
+#define PRESENCE_AUTO_TALK   true          // start talking to XiaoZhi when someone walks up
+#define PRESENCE_AUTO_TALK_COOLDOWN_MS 60000
 
 #endif // _BOARD_CONFIG_H_
